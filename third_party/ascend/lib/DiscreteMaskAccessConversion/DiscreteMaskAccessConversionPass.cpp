@@ -651,20 +651,12 @@ struct DiscreteMaskAtomicConversion
 
   LogicalResult matchAndRewrite(mlir::triton::AtomicRMWOp op,
                                 PatternRewriter &rewriter) const final {
-    auto loc = op.getLoc();
-    auto ptr = op.getPtr();
-    auto src = op.getVal();
-    auto mask = op.getMask();
-    RMWOp rmwOp = op.getAtomicRmwOp();
-
-    if (failed(isDiscreteMask(op, mask, rewriter)))
+    if (failed(isDiscreteMask(op, op.getMask(), rewriter)))
       return failure();
 
-    // Keep the original mask for the SIMT atomic template when the pointer
-    // needs the indirect atomic ABI. The unstructure pass flattens it together
-    // with offsets and values; replacing it with a select here would lose that
-    // lane mask. Structured pointers do not need the indirect ABI, so fall
-    // through to the SIMD select+atomic rewrite below instead.
+    // Mark the pointer that needs the indirect atomic ABI differently: the
+    // unstructure pass flattens the mask together with offsets and values, and
+    // it recognises that shape by its own attribute.
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(compileModeFlag) &&
         !routeToSIMD(op, rewriter)) {
@@ -673,57 +665,20 @@ struct DiscreteMaskAtomicConversion
       return failure();
     }
 
-    const std::map<RMWOp, TypelessValue> initMap = {
-        {RMWOp::FADD, TypelessValue::Zero},
-        {RMWOp::ADD, TypelessValue::Zero},
-        {RMWOp::UMAX, TypelessValue::Zero},
-        {RMWOp::OR, TypelessValue::Zero},
-        {RMWOp::MIN, TypelessValue::Max},
-        {RMWOp::UMIN, TypelessValue::Max},
-        {RMWOp::AND, TypelessValue::Max},
-        {RMWOp::MAX, TypelessValue::Min},
-        {RMWOp::XOR, TypelessValue::Zero},
-        {RMWOp::XCHG, TypelessValue::Undefined},
-    };
-    assert(initMap.find(rmwOp) != initMap.end());
-    auto typelessVal = initMap.at(rmwOp);
-    if (typelessVal == TypelessValue::Undefined) {
-      // Undefined default value atomic op will be decomposed in AscendNPU-IR
-      op->setAttr(ConverterUtils::discreteMaskAttrName,
-                  UnitAttr::get(rewriter.getContext()));
-      return failure();
-    }
-
-    auto [contMask, discMask] = decomposeAndMask(op, mask, loc, rewriter);
-    FailureOr<mlir::Value> fill = specializeTypelessValueToConstant(
-        typelessVal, src.getType(), loc, rewriter);
-    if (failed(fill)) {
-      LLVM_DEBUG({
-        llvm::dbgs() << "Unsupported type for constant creation: "
-                     << src.getType() << "\n";
-      });
-      op->emitError("Unsupported atomic operation.");
-      return failure();
-    }
-
-    // For mask = contMask & discMask, retain contMask as the memory-access
-    // guard and replace only the discrete part with the RMW identity value.
-    // The continuous mask can then be lowered to a bounded subview without
-    // accessing the masked-off tail.
-    Value valueMask = mask;
-    Value accessMask = nullptr;
-    if (contMask && discMask) {
-      valueMask = discMask;
-      accessMask = contMask;
-    }
-
-    auto maskedValue =
-        rewriter.create<arith::SelectOp>(loc, valueMask, src, *fill);
-    auto newAtomicOp = rewriter.create<mlir::triton::AtomicRMWOp>(
-        loc, src.getType(), rmwOp, ptr, maskedValue, accessMask, op.getSem(),
-        op.getScope());
-    rewriter.replaceOp(op, newAtomicOp);
-    return success();
+    // Leave the mask alone: it travels to hfusion.atomic_rmw as a mask operand,
+    // which is the only place that can decide whether the hardware atomic can
+    // serve this op or whether it has to become a locked read-modify-write.
+    // Folding the mask into the value with the atomic identity would let
+    // masked-off elements take part after all - add zero, max with the type
+    // minimum - which Triton requires to be left untouched, and it would hide
+    // the mask from that decision.
+    //
+    // The op is left as it stands; the attribute only records that its mask is
+    // discrete, which `UseAnalysis` needs to keep the mask SSA live and the
+    // unstructured fallback needs to recognise.
+    op->setAttr(ConverterUtils::discreteMaskAttrName,
+                UnitAttr::get(rewriter.getContext()));
+    return failure();
   }
 };
 
