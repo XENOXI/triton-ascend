@@ -22,10 +22,14 @@
  * THE SOFTWARE.
  */
 
-#include "ir.h"
+// Python.h (via pybind11) must precede any system header: pyconfig.h
+// redefines _POSIX_C_SOURCE/_XOPEN_SOURCE, which glibc's features.h
+// already set to newer values, and -Werror turns that into an error.
 #include "pybind11/pybind11.h"
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
+
+#include "ir.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 

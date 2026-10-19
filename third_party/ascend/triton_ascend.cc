@@ -1,3 +1,9 @@
+// Python.h (via pybind11) must precede any system header: pyconfig.h
+// redefines _POSIX_C_SOURCE/_XOPEN_SOURCE, which glibc's features.h
+// already set to newer values, and -Werror turns that into an error.
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -31,9 +37,6 @@
 
 #include "ir.h" // TritonOpBuilder
 #include "triton/Dialect/Triton/IR/Dialect.h"
-
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include <cstdint>
 #include <limits>

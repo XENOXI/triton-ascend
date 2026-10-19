@@ -24,13 +24,16 @@
 #ifndef LIBENTRY_H
 #define LIBENTRY_H
 
+// Python.h (via pybind11) must precede any system header: pyconfig.h
+// redefines _POSIX_C_SOURCE/_XOPEN_SOURCE, which glibc's features.h
+// already set to newer values, and -Werror turns that into an error.
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
 #include <any>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 namespace py = pybind11;
 
