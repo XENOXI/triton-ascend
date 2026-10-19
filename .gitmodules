@@ -2,3 +2,4 @@
 	path = third_party/ascend/AscendNPU-IR
 	url = https://gitcode.com/XENOXI/AscendNPU-IR.git
     depth = 1
+	branch = atomic_wip
