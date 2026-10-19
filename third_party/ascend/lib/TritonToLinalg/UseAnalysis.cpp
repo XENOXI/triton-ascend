@@ -549,8 +549,11 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
         setMixUseFromValue(yield);
       }
     } else if (auto atomicRmwOp = dyn_cast<triton::AtomicRMWOp>(op)) {
-      auto mask = atomicRmwOp.getMask();
-      if (mask && op->hasAttr(ConverterUtils::discreteMaskAttrName))
+      // Every atomic RMW mask ends up as a real operand of the HFusion atomic,
+      // whatever shape its active set has, so the ops computing it have to
+      // survive as ordinary tensor arithmetic. As mask metadata they would be
+      // folded away and the operand would dangle.
+      if (auto mask = atomicRmwOp.getMask())
         setMixUseRecursively(mask.getDefiningOp());
     }
   });

@@ -900,123 +900,99 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
   auto inputMemref = getInputMemref();
   auto inputMemrefType = cast<MemRefType>(inputMemref.getType());
   auto elementType = inputMemrefType.getElementType();
-  auto isHardwareSupported =
-      (rmwOp == RMWOp::ADD || rmwOp == RMWOp::FADD || rmwOp == RMWOp::MAX ||
-       rmwOp == RMWOp::MIN) &&
-      (elementType.isF16() || elementType.isBF16() || elementType.isF32() ||
-       elementType.isInteger(8) || elementType.isInteger(16) ||
-       elementType.isInteger(32));
 
-  bool isDiscreteMask = false;
-  bool hasContinuousMaskSubview = false;
   bool hasUsedReturn = !op.getResult().use_empty();
-  MaskState mstate;
+
+  // Every mask is handed to the atomic op as an operand, whatever shape the
+  // active set has. The op is the only place that can decide what to do with
+  // it: a mask the hardware atomic cannot express forces the software
+  // read-modify-write, and that choice depends on the element type and atomic
+  // kind, which `hfusion.atomic_rmw` already weighs. Narrowing the op to a
+  // subview here, or folding the mask into the value with the atomic identity,
+  // would take that decision away from it.
+  //
+  // `ins`, `outs`, `mask` and the result all keep the full pointer shape, so
+  // they agree by construction.
+  Value memrefMask;
   if (mask) {
     auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
     if (constantMask && !isConstantMaskTrue(mask)) {
       rewriter.eraseOp(op);
       return success();
     }
-    isDiscreteMask = mstate.parse(mask, loc, rewriter).failed();
-    if (!constantMask && !isDiscreteMask) {
-      // For dstMemref (store output), use subview to maintain reference to
-      // original memref. For inputVal (store input), use tensor.extract_slice
-      // to keep tensor semantics.
-      dstMemref = mstate.getSubview(ptr, loc, rewriter);
-      hasContinuousMaskSubview = true;
-      if (isHardwareSupported) {
-        auto inputTensorType = RankedTensorType::get(
-            inputMemrefType.getShape(), inputMemrefType.getElementType());
-        if (!isa<RankedTensorType>(inputVal.getType()))
-          inputVal = rewriter.create<bufferization::ToTensorOp>(
-              loc, inputTensorType, inputMemref, true, true);
-        inputVal = mstate.getExtractSlice(inputVal, loc, rewriter);
-      } else {
-        inputMemref = mstate.getSubview(inputMemref, loc, rewriter);
+    // An all-true constant mask is dropped rather than passed on, so an
+    // unconditional atomic still reaches the single-instruction form.
+    if (!constantMask) {
+      memrefMask = mask;
+      if (auto maskTypeT = dyn_cast<TensorType>(mask.getType())) {
+        MemRefType maskTypeM =
+            MemRefType::get(maskTypeT.getShape(), maskTypeT.getElementType());
+        memrefMask =
+            rewriter.create<bufferization::ToBufferOp>(loc, maskTypeM, mask);
       }
     }
   }
 
-  bool needsReturnValueLock =
-      hasUsedReturn && hasContinuousMaskSubview && isHardwareSupported;
-  Value returnValueLock;
-  if (hasUsedReturn) {
+  // The pre-image can either be handed back by the atomic op itself or be
+  // copied out here beforehand.
+  //
+  // Returning it from the op is what we want: the expansion in BiShengIR reads
+  // GM inside its own critical section, so the old value is consistent by
+  // construction. The copy below is not inside any critical section of its own;
+  // it relies on `addSyncForReturnedValue` in HIVMDecomposeOp recognising the
+  // copy/atomic-store pair afterwards and wrapping it. It is only still here
+  // for XCHG, and for a result shape the op cannot yield.
+  //
+  // The op yields the pre-image straight out of its staging buffer, so what it
+  // hands back is the plain, layout-free shape of its destination.
+  auto dstMemrefType = cast<MemRefType>(dstMemref.getType());
+  auto preImageType = RankedTensorType::get(dstMemrefType.getShape(),
+                                            dstMemrefType.getElementType());
+  bool returnThroughOp = hasUsedReturn && rmwOp != RMWOp::XCHG &&
+                         resType == cast<TensorType>(preImageType);
+
+  if (hasUsedReturn && !returnThroughOp) {
     auto tensorType =
         RankedTensorType::get(ptrType.getShape(), ptrType.getElementType());
     auto alloc = rewriter.create<memref::AllocOp>(
         loc, MemRefType::get(ptrType.getShape(), ptrType.getElementType()));
-    Value copySrc = ptr;
-    Value copyDst = alloc;
-    if (hasContinuousMaskSubview) {
-      // Masked-off atomic results are undefined. Copy only the active region
-      // so the old-value read and the atomic store use the same address view.
-      copySrc = dstMemref;
-      copyDst = mstate.getSubview(alloc, loc, rewriter);
-    }
-    if (needsReturnValueLock) {
-      auto lockType = MemRefType::get({1}, rewriter.getI64Type());
-      auto lockVar =
-          rewriter.create<hivm::CreateSyncBlockLockOp>(loc, lockType, Value());
-      returnValueLock = lockVar.getResult();
-      rewriter.create<hivm::SyncBlockLockOp>(loc, returnValueLock);
-    }
-    rewriter.create<memref::CopyOp>(loc, copySrc, copyDst);
+    // No lock is taken around this copy: the matching SyncBlockUnlockOp lived
+    // in the hardware-atomic branch that this converter no longer emits, so
+    // taking one here would never be released. The critical section is left to
+    // `addSyncForReturnedValue` in HIVMDecomposeOp, which pairs this copy with
+    // the atomic store and marks the store `already_sync`.
+    rewriter.create<memref::CopyOp>(loc, ptr, alloc);
     Value tensorToReplace = rewriter.create<bufferization::ToTensorOp>(
         loc, tensorType, alloc, true /* restrict */, true /* writable */);
     rewriter.replaceOp(op, tensorToReplace);
   }
 
-  if (isDiscreteMask) {
-    if (rmwOp != RMWOp::XCHG) {
-      return op.emitError(
-          "Discrete mask is only expected for XCHG; other atomics "
-          "should be lowered without discrete masks");
-    }
-    Value memrefMask = mask;
-    if (auto maskTypeT = dyn_cast<TensorType>(mask.getType())) {
-      MemRefType maskTypeM =
-          MemRefType::get(maskTypeT.getShape(), maskTypeT.getElementType());
-      memrefMask =
-          rewriter.create<bufferization::ToBufferOp>(loc, maskTypeM, mask);
-    }
-    rewriter.create<hfusion::AtomicXchgOp>(op.getLoc(), TypeRange(),
-                                           inputMemref, dstMemref, memrefMask);
-  } else {
-    if (isHardwareSupported) {
-      auto storeOp = rewriter.create<hivm::StoreOp>(
-          op.getLoc(), TypeRange{}, inputVal, dstMemref, atomicKind);
-      if (needsReturnValueLock) {
-        // The return-value copy and the atomic update must be one critical
-        // section. Mark the store so HIVM does not add another lock.
-        storeOp->setAttr(kAlreadySyncAttr, rewriter.getUnitAttr());
-        rewriter.create<hivm::SyncBlockUnlockOp>(loc, returnValueLock);
-      }
-    } else if (rmwOp == RMWOp::XCHG)
+  if (rmwOp == RMWOp::XCHG) {
+    if (memrefMask)
+      rewriter.create<hfusion::AtomicXchgOp>(
+          op.getLoc(), TypeRange(), inputMemref, dstMemref, memrefMask);
+    else
       rewriter.create<hfusion::AtomicXchgOp>(op.getLoc(), TypeRange(),
                                              inputMemref, dstMemref);
-    else {
-      if (rmwOp == RMWOp::OR || rmwOp == RMWOp::XOR || rmwOp == RMWOp::AND) {
-        if (!elementType.isSignlessIntOrIndex()) {
-          return op->emitOpError()
-                 << "must be signless-integer-like, but got " << elementType;
-        }
-      }
-      // Currently, for atomic kind and element type that is not supported by
-      // the hardware, we use software to simulate the computation. However,
-      // decompose now happens in both HFusion and HIVM, and is not consistent
-      // for 910B and 91095. Therefore, we convert to different atomic/store ops
-      // for now. This should be unified and refactored later.
-      if (compileOn91095Flag) {
-        rewriter.create<hfusion::StoreOp>(
-            op.getLoc(), TypeRange{}, ValueRange{inputMemref},
-            ValueRange{dstMemref}, hfusionAtomicKind,
-            ArrayRef<NamedAttribute>{});
-      } else {
-        rewriter.create<hfusion::AtomicRMWOp>(op.getLoc(), TypeRange(),
-                                              inputMemref, dstMemref,
-                                              hfusionAtomicKind);
+  } else {
+    if (rmwOp == RMWOp::OR || rmwOp == RMWOp::XOR || rmwOp == RMWOp::AND) {
+      if (!elementType.isSignlessIntOrIndex()) {
+        return op->emitOpError()
+               << "must be signless-integer-like, but got " << elementType;
       }
     }
+    // Currently, for atomic kind and element type that is not supported by
+    // the hardware, we use software to simulate the computation.
+    //
+    // Only ask for a result when one is actually consumed. An unused result
+    // would still make BiShengIR treat this as a returning RMW and force the
+    // software decomposition, throwing away the single-instruction hardware
+    // atomic that the no-result form lowers to.
+    auto atomicRMW = rewriter.create<hfusion::AtomicRMWOp>(
+        op.getLoc(), returnThroughOp ? TypeRange(preImageType) : TypeRange(),
+        inputMemref, dstMemref, memrefMask, hfusionAtomicKind);
+    if (returnThroughOp)
+      rewriter.replaceOp(op, atomicRMW->getResult(0));
   }
 
   if (op.getResult().use_empty()) {
